@@ -3,9 +3,7 @@ let expiredAt = null;
 let endpoint = null;
 let clientId = "76a75279-2ffa-4c3d-8db8-7b47252aa41c";
 
-// 删除这行：const API_KEY = globalThis.API_KEY;
-
-// 添加缓存和预刷新机制
+// 缓存和预刷新机制
 const TOKEN_REFRESH_BEFORE_EXPIRY = 5 * 60; // 提前5分钟刷新token
 let tokenInfo = {
     endpoint: null,
@@ -13,7 +11,7 @@ let tokenInfo = {
     expiredAt: null
 };
 
-// 在文件顶部常量定义区域添加映射表
+// 语音名称映射表
 const VOICE_MAPPING = {
     'alloy': 'zh-CN-XiaoxiaoNeural',
     'echo': 'zh-CN-YunxiNeural', 
@@ -23,14 +21,12 @@ const VOICE_MAPPING = {
     'shimmer': 'zh-CN-XiaomengNeural'
 };
 
-// 替换原来的 addEventListener
 export default {
     async fetch(request, env, ctx) {
         return handleRequest(request, env);
     }
 };
 
-// handleRequest 增加 env 参数
 async function handleRequest(request, env) {
     if (request.method === "OPTIONS") {
         return handleOptions(request);
@@ -38,18 +34,25 @@ async function handleRequest(request, env) {
     
     // 从 env 读取 API_KEY
     const API_KEY = env.API_KEY;
+    const requestUrl = new URL(request.url);
+    const path = requestUrl.pathname;
     
     // 只在设置了 API_KEY 的情况下才验证
     if (API_KEY) {
         const authHeader = request.headers.get("authorization");
-        const apiKey = authHeader?.startsWith("Bearer ") 
+        // 兼容 GET 请求：优先从 Headers 读，读不到再从 URL 参数的 ?key= 读
+        let apiKey = authHeader?.startsWith("Bearer ") 
             ? authHeader.slice(7) 
             : null;
+            
+        if (!apiKey) {
+            apiKey = requestUrl.searchParams.get("key"); // 支持 URL 传参校验
+        }
                       
         if (apiKey !== API_KEY) {
             return new Response(JSON.stringify({
                 error: {
-                    message: "Invalid API key. Use 'Authorization: Bearer your-api-key' header",
+                    message: "Invalid API key. Use header 'Authorization: Bearer your-key' or URL param '&key=your-key'",
                     type: "invalid_request_error",
                     param: null,
                     code: "invalid_api_key"
@@ -64,27 +67,42 @@ async function handleRequest(request, env) {
         }
     }
 
-    const requestUrl = new URL(request.url);
-    const path = requestUrl.pathname;
-    
-    if (path === "/v1/audio/speech") {
+    // 同时兼容旧的 OpenAI 路径和更语义化的 /tts 路径
+    if (path === "/v1/audio/speech" || path === "/tts") {
         try {
-            const requestBody = await request.json();
-            let { 
-                model = "tts-1",
-                input,
-                voice = "zh-CN-XiaoxiaoNeural",
-                response_format = "mp3",
-                speed = 1.0,
-                pitch = 1.0,
-                style = "general"
-            } = requestBody;
+            let input, voice, speed, pitch, style;
 
-            // 添加语音名称映射
-            voice = VOICE_MAPPING[voice] || voice;  // 如果存在映射则替换，否则保持原值
+            // 【核心修改】如果是 GET 请求，从 URL 参数解析
+            if (request.method === "GET") {
+                input = requestUrl.searchParams.get("input") || "";
+                voice = requestUrl.searchParams.get("voice") || "zh-CN-XiaoxiaoNeural";
+                speed = parseFloat(requestUrl.searchParams.get("speed") || "1.0");
+                pitch = parseFloat(requestUrl.searchParams.get("pitch") || "1.0");
+                style = requestUrl.searchParams.get("style") || "general";
+            } 
+            // 如果还想保留原本的 POST 兼容（比如某些第三方客户端调用）
+            else if (request.method === "POST") {
+                const requestBody = await request.json();
+                input = requestBody.input || "";
+                voice = requestBody.voice || "zh-CN-XiaoxiaoNeural";
+                speed = requestBody.speed || 1.0;
+                pitch = requestBody.pitch || 1.0;
+                style = requestBody.style || "general";
+            }
+
+            if (!input) {
+                return new Response(JSON.stringify({ error: "Missing 'input' parameter" }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
+                });
+            }
+
+            // 语音名称映射
+            voice = VOICE_MAPPING[voice] || voice; 
 
             const rate = ((speed - 1) * 100).toFixed(0);
-            const numPitch = ((pitch - 1) * 100).toFixed(0); // 将 pitch 参数转换为百分比形式
+            const numPitch = ((pitch - 1) * 100).toFixed(0); 
+            
             const response = await getVoice(
                 input, 
                 voice, 
@@ -116,7 +134,6 @@ async function handleRequest(request, env) {
         }
     }
 
-    // 默认返回 404
     return new Response("Not Found", { status: 404 });
 }
 
@@ -133,20 +150,17 @@ async function handleOptions(request) {
 
 async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = 0, pitch = 0, style = "general", outputFormat = "audio-24khz-48kbitrate-mono-mp3", download = false) {
     try {
-        const maxChunkSize = 2000; // 假设每次请求的最大文本长度为2000字符
+        const maxChunkSize = 2000; 
         const chunks = [];
 
-        // 将长文本分段
         for (let i = 0; i < text.length; i += maxChunkSize) {
             const chunk = text.slice(i, i + maxChunkSize);
             chunks.push(chunk);
         }
 
-        // 获取每个分段的音频
         const audioChunks = await Promise.all(chunks.map(chunk => getAudioChunk(chunk, voiceName, rate, pitch, style, outputFormat)));
-
-        // 将音频片段拼接起来
         const concatenatedAudio = new Blob(audioChunks, { type: 'audio/mpeg' });
+        
         const response = new Response(concatenatedAudio, {
             headers: {
                 "Content-Type": "audio/mpeg",
@@ -163,24 +177,14 @@ async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = 0, pitc
     } catch (error) {
         console.error("语音合成失败:", error);
         return new Response(JSON.stringify({
-            error: {
-                message: error.message,
-                type: "api_error",
-                param: null,
-                code: "edge_tts_error"
-            }
+            error: { message: error.message, type: "api_error", param: null, code: "edge_tts_error" }
         }), {
             status: 500,
-            headers: {
-                "Content-Type": "application/json",
-                ...makeCORSHeaders()
-            }
+            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
         });
     }
 }
 
-
-//获取单个音频数据
 async function getAudioChunk(text, voiceName, rate, pitch, style, outputFormat) {
     const endpoint = await getEndpoint();
     const url = `https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/v1`;
@@ -204,7 +208,7 @@ async function getAudioChunk(text, voiceName, rate, pitch, style, outputFormat) 
     return response.blob();
 }
 
-function getSsml(text, voiceName, rate, pitch,style) {
+function getSsml(text, voiceName, rate, pitch, style) {
     return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN"> 
                 <voice name="${voiceName}"> 
                     <mstts:express-as style="${style}"  styledegree="1.0" role="default" > 
@@ -212,20 +216,14 @@ function getSsml(text, voiceName, rate, pitch,style) {
                     </mstts:express-as> 
                 </voice> 
             </speak>`;
-
 }
 
-// 优化 getEndpoint 函数
 async function getEndpoint() {
     const now = Date.now() / 1000;
-    
-    // 检查token是否有效（提前5分钟刷新）
     if (tokenInfo.token && tokenInfo.expiredAt && now < tokenInfo.expiredAt - TOKEN_REFRESH_BEFORE_EXPIRY) {
-        console.log(`使用缓存的token，剩余 ${((tokenInfo.expiredAt - now) / 60).toFixed(1)} 分钟`);
         return tokenInfo.endpoint;
     }
 
-    // 获取新token
     const endpointUrl = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0";
     const clientId = crypto.randomUUID().replace(/-/g, "");
     
@@ -254,51 +252,32 @@ async function getEndpoint() {
         const jwt = data.t.split(".")[1];
         const decodedJwt = JSON.parse(atob(jwt));
         
-        // 更新缓存
         tokenInfo = {
             endpoint: data,
             token: data.t,
             expiredAt: decodedJwt.exp
         };
 
-        console.log(`获取新token成功，有效期 ${((decodedJwt.exp - now) / 60).toFixed(1)} 分钟`);
         return data;
-
     } catch (error) {
         console.error("获取endpoint失败:", error);
-        // 如果有缓存的token，即使过期也尝试使用
-        if (tokenInfo.token) {
-            console.log("使用过期的缓存token");
-            return tokenInfo.endpoint;
-        }
+        if (tokenInfo.token) return tokenInfo.endpoint;
         throw error;
     }
 }
 
-function addCORSHeaders(response) {
-    const newHeaders = new Headers(response.headers);
-    for (const [key, value] of Object.entries(makeCORSHeaders())) {
-        newHeaders.set(key, value);
-    }
-    return new Response(response.body, { ...response, headers: newHeaders });
-}
-
 function makeCORSHeaders() {
     return {
-        "Access-Control-Allow-Origin": "*", // 可以将 "*" 替换为特定的来源，例如 "https://9a17e592.text2voice.pages.dev"
+        "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, x-api-key",
-        "Access-Control-Max-Age": "86400" // 允许OPTIONS请求预检缓存的时间
+        "Access-Control-Max-Age": "86400"
     };
 }
 
 async function hmacSha256(key, data) {
     const cryptoKey = await crypto.subtle.importKey(
-        "raw",
-        key,
-        { name: "HMAC", hash: { name: "SHA-256" } },
-        false,
-        ["sign"]
+        "raw", key, { name: "HMAC", hash: { name: "SHA-256" } }, false, ["sign"]
     );
     const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
     return new Uint8Array(signature);
@@ -334,24 +313,5 @@ async function sign(urlStr) {
 }
 
 function dateFormat() {
-    const formattedDate = (new Date()).toUTCString().replace(/GMT/, "").trim() + " GMT";
-    return formattedDate.toLowerCase();
-}
-
-// 添加请求超时控制
-async function fetchWithTimeout(url, options, timeout = 30000) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeout);
-    
-    try {
-        const response = await fetch(url, {
-            ...options,
-            signal: controller.signal
-        });
-        clearTimeout(id);
-        return response;
-    } catch (error) {
-        clearTimeout(id);
-        throw error;
-    }
+    return ((new Date()).toUTCString().replace(/GMT/, "").trim() + " GMT").toLowerCase();
 }
